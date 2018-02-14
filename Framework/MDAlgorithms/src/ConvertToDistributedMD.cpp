@@ -287,9 +287,9 @@ void ConvertToDistributedMD::exec() {
 //    ranks
 // 4. Share the preliminary box structure with all ranks
 // 5. Convert all events
-// 6. Disable the box controller and add events to the local box structure
+// 6. Add events to the local box structure
 // 7. Send data from the each rank to the correct rank
-// 8. Enable the box controller and start splitting the data
+// 8. Split the data
 // 9. Ensure that the fileIDs and the box controller stats are correct.
 // 10. Maybe save in this algorithm already
 #if MEASURE_ALL
@@ -882,6 +882,14 @@ void ConvertToDistributedMD::redistributeData() {
   auto localRank = communicator.rank();
   auto startIndex = m_responsibility[localRank].first;
   auto stopIndex = m_responsibility[localRank].second;
+
+  for (auto index = startIndex; index <= stopIndex; ++index) {
+    auto mdBox = mdBoxes[index];
+    auto &events = boxVsMDEvents.at(index);
+    auto &oldEvents = mdBox->getEvents();
+    oldEvents.swap(events);
+    MDEventList().swap(events);
+  }
 
   // Remove the data which is not relevant for the local rank which is before
   // the startIndex
