@@ -91,7 +91,6 @@ class EditorIO(object):
 
 
 class PythonFileInterpreter(QWidget):
-
     sig_editor_modified = Signal(bool)
     sig_filename_modified = Signal(str)
 
@@ -115,7 +114,7 @@ class PythonFileInterpreter(QWidget):
         self._setup_editor(content, filename)
 
         self._presenter = PythonFileInterpreterPresenter(self,
-                                                         PythonCodeExecution())
+                                                         PythonCodeExecution(content))
 
         self.editor.modificationChanged.connect(self.sig_editor_modified)
         self.editor.fileNameChanged.connect(self.sig_filename_modified)
@@ -165,7 +164,7 @@ class PythonFileInterpreter(QWidget):
         # set a margin large enough for sensible file sizes < 1000 lines
         # and the progress marker
         font_metrics = QFontMetrics(self.font())
-        editor.setMarginWidth(1, font_metrics.averageCharWidth()*3 + 12)
+        editor.setMarginWidth(1, font_metrics.averageCharWidth() * 3 + 20)
 
         # fill with content if supplied and set source filename
         if default_content is not None:
@@ -190,6 +189,9 @@ class PythonFileInterpreterPresenter(QObject):
         self._code_start_offset = 0
         self._is_executing = False
         self._error_formatter = ErrorFormatter()
+
+        # If startup code was executed then populate autocomplete
+        self.view.editor.updateCompletionAPI(self.model.generate_calltips())
 
         # connect signals
         self.model.sig_exec_success.connect(self._on_exec_success)
@@ -230,7 +232,10 @@ class PythonFileInterpreterPresenter(QObject):
         else:
             code_str = editor.text()
             line_from = 0
-        return code_str, line_from
+        # Pad code out with empty lines so that reported line numbers
+        # do not have to be adjusted
+        padded = '\n'*line_from + code_str
+        return padded, line_from
 
     def _on_exec_success(self, task_result):
         self.view.editor.updateCompletionAPI(self.model.generate_calltips())

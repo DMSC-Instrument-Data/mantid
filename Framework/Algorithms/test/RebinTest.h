@@ -36,7 +36,7 @@ std::unique_ptr<Rebin> prepare_rebin(const Parallel::Communicator &comm,
   auto create = ParallelTestHelpers::create<Algorithms::CreateWorkspace>(comm);
   std::vector<double> dataEYX(2000);
   for (size_t i = 0; i < dataEYX.size(); ++i)
-    dataEYX[i] = static_cast<double>(i % 2 + 1);
+    dataEYX[i] = static_cast<double>(i % 2);
   int nspec = 1000;
   create->setProperty<int>("NSpec", nspec);
   create->setProperty<std::vector<double>>("DataX", dataEYX);
@@ -69,19 +69,12 @@ void run_rebin_params_only_bin_width(const Parallel::Communicator &comm,
   using namespace Parallel;
   auto rebin = prepare_rebin(comm, storageMode);
   rebin->setProperty("Params", "0.5");
-  if (fromString(storageMode) == StorageMode::Distributed && comm.size() > 1) {
-    TS_ASSERT_THROWS_EQUALS(
-        rebin->execute(), const std::runtime_error &e, std::string(e.what()),
-        "MatrixWorkspace: Parallel support for XMin and XMax not implemented.");
+  TS_ASSERT_THROWS_NOTHING(rebin->execute());
+  MatrixWorkspace_const_sptr ws = rebin->getProperty("OutputWorkspace");
+  if (comm.rank() == 0 || fromString(storageMode) != StorageMode::MasterOnly) {
+    TS_ASSERT_EQUALS(ws->storageMode(), fromString(storageMode));
   } else {
-    TS_ASSERT_THROWS_NOTHING(rebin->execute());
-    MatrixWorkspace_const_sptr ws = rebin->getProperty("OutputWorkspace");
-    if (comm.rank() == 0 ||
-        fromString(storageMode) != StorageMode::MasterOnly) {
-      TS_ASSERT_EQUALS(ws->storageMode(), fromString(storageMode));
-    } else {
-      TS_ASSERT_EQUALS(ws, nullptr);
-    }
+    TS_ASSERT_EQUALS(ws, nullptr);
   }
 }
 }
@@ -431,9 +424,8 @@ public:
 
     // turn the mask list into an array like the Y values
     MantidVec weights(outY.size(), 0);
-    for (MatrixWorkspace::MaskList::const_iterator it = mask.begin();
-         it != mask.end(); ++it) {
-      weights[it->first] = it->second;
+    for (auto it : mask) {
+      weights[it.first] = it.second;
     }
 
     // the degree of masking must be the same as the reduction in the y-value,
@@ -491,9 +483,8 @@ public:
 
     // turn the mask list into an array like the Y values
     MantidVec weights(outY.size(), 0);
-    for (MatrixWorkspace::MaskList::const_iterator it = mask.begin();
-         it != mask.end(); ++it) {
-      weights[it->first] = it->second;
+    for (auto it : mask) {
+      weights[it.first] = it.second;
     }
 
     // the degree of masking must be the same as the reduction in the y-value,

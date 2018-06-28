@@ -244,7 +244,7 @@ public:
     alg.setProperty("OutputWorkspace", "IvsQ");
     alg.setProperty("OutputWorkspaceBinned", "IvsQ_binned");
     alg.setProperty("OutputWorkspaceWavelength", "IvsLam");
-    alg.setProperty("ProcessingInstructions", "3:4");
+    alg.setProperty("ProcessingInstructions", "3");
     alg.execute();
     MatrixWorkspace_sptr out = alg.getProperty("OutputWorkspace");
 
@@ -270,25 +270,16 @@ public:
     TS_ASSERT_EQUALS(instIn->getComponentByName("linear-detector")->getPos(),
                      instOut->getComponentByName("linear-detector")->getPos());
 
-    // Only 'point-detector' and 'point-detector2' should have been moved
-    // vertically (along Y)
+    // Only 'point-detector' should have been moved vertically (along Y)
 
     auto point1In = instIn->getComponentByName("point-detector")->getPos();
-    auto point2In = instIn->getComponentByName("point-detector2")->getPos();
     auto point1Out = instOut->getComponentByName("point-detector")->getPos();
-    auto point2Out = instOut->getComponentByName("point-detector2")->getPos();
 
     TS_ASSERT_EQUALS(point1In.X(), point1Out.X());
     TS_ASSERT_EQUALS(point1In.Z(), point1Out.Z());
-    TS_ASSERT_EQUALS(point2In.X(), point2Out.X());
-    TS_ASSERT_EQUALS(point2In.Z(), point2Out.Z());
     TS_ASSERT_DIFFERS(point1In.Y(), point1Out.Y());
-    TS_ASSERT_DIFFERS(point2In.Y(), point2Out.Y());
     TS_ASSERT_DELTA(point1Out.Y() /
                         (point1Out.Z() - instOut->getSample()->getPos().Z()),
-                    std::tan(theta * 2 * M_PI / 180), 1e-4);
-    TS_ASSERT_DELTA(point2Out.Y() /
-                        (point2Out.Z() - instOut->getSample()->getPos().Z()),
                     std::tan(theta * 2 * M_PI / 180), 1e-4);
   }
 
@@ -399,7 +390,7 @@ public:
     alg.setProperty("OutputWorkspace", "IvsQ");
     alg.setProperty("OutputWorkspaceBinned", "IvsQ_binned");
     alg.setProperty("OutputWorkspaceWavelength", "IvsLam");
-    alg.setProperty("ProcessingInstructions", "3:4");
+    alg.setProperty("ProcessingInstructions", "3");
     alg.execute();
     MatrixWorkspace_sptr corrected = alg.getProperty("OutputWorkspace");
 
@@ -417,25 +408,17 @@ public:
     TS_ASSERT_EQUALS(instIn->getComponentByName("linear-detector")->getPos(),
                      instOut->getComponentByName("linear-detector")->getPos());
 
-    // Only 'point-detector' and 'point-detector2' should have been moved
+    // Only 'point-detector' should have been moved
     // vertically (along Y)
 
     auto point1In = instIn->getComponentByName("point-detector")->getPos();
-    auto point2In = instIn->getComponentByName("point-detector2")->getPos();
     auto point1Out = instOut->getComponentByName("point-detector")->getPos();
-    auto point2Out = instOut->getComponentByName("point-detector2")->getPos();
 
     TS_ASSERT_EQUALS(point1In.X(), point1Out.X());
     TS_ASSERT_EQUALS(point1In.Z(), point1Out.Z());
-    TS_ASSERT_EQUALS(point2In.X(), point2Out.X());
-    TS_ASSERT_EQUALS(point2In.Z(), point2Out.Z());
     TS_ASSERT_DIFFERS(point1In.Y(), point1Out.Y());
-    TS_ASSERT_DIFFERS(point2In.Y(), point2Out.Y());
     TS_ASSERT_DELTA(point1Out.Y() /
                         (point1Out.Z() - instOut->getSample()->getPos().Z()),
-                    std::tan(theta * 2 * M_PI / 180), 1e-4);
-    TS_ASSERT_DELTA(point2Out.Y() /
-                        (point2Out.Z() - instOut->getSample()->getPos().Z()),
                     std::tan(theta * 2 * M_PI / 180), 1e-4);
   }
 
@@ -452,7 +435,7 @@ public:
     alg.setProperty("OutputWorkspace", "IvsQ");
     alg.setProperty("OutputWorkspaceBinned", "IvsQ_binned");
     alg.setProperty("OutputWorkspaceWavelength", "IvsLam");
-    alg.setProperty("ProcessingInstructions", "3:4");
+    alg.setProperty("ProcessingInstructions", "3");
     alg.execute();
     MatrixWorkspace_sptr corrected = alg.getProperty("OutputWorkspace");
 
@@ -463,12 +446,9 @@ public:
     // the detectors should not have been moved
 
     auto point1In = instIn->getComponentByName("point-detector")->getPos();
-    auto point2In = instIn->getComponentByName("point-detector2")->getPos();
     auto point1Out = instOut->getComponentByName("point-detector")->getPos();
-    auto point2Out = instOut->getComponentByName("point-detector2")->getPos();
 
     TS_ASSERT_EQUALS(point1In, point1Out);
-    TS_ASSERT_EQUALS(point2In, point2Out);
   }
 
   void test_sum_transmission_workspaces() {
@@ -583,6 +563,88 @@ public:
     // X range in outQ
     TS_ASSERT_DELTA(outQ->x(0)[0], 0.3353, 0.0001);
     TS_ASSERT_DELTA(outQ->x(0)[7], 0.5962, 0.0001);
+  }
+
+  void test_polarization_correction() {
+
+    MatrixWorkspace_sptr first = m_TOF->clone();
+    MatrixWorkspace_sptr second = m_TOF->clone();
+    MatrixWorkspace_sptr third = m_TOF->clone();
+    MatrixWorkspace_sptr fourth = m_TOF->clone();
+
+    WorkspaceGroup_sptr inputWSGroup = boost::make_shared<WorkspaceGroup>();
+    inputWSGroup->addWorkspace(first);
+    inputWSGroup->addWorkspace(second);
+    inputWSGroup->addWorkspace(third);
+    inputWSGroup->addWorkspace(fourth);
+    WorkspaceGroup_sptr transWSGroup = boost::make_shared<WorkspaceGroup>();
+    transWSGroup->addWorkspace(first);
+    transWSGroup->addWorkspace(second);
+    transWSGroup->addWorkspace(third);
+    transWSGroup->addWorkspace(fourth);
+    AnalysisDataService::Instance().addOrReplace("input", inputWSGroup);
+    AnalysisDataService::Instance().addOrReplace("trans", transWSGroup);
+
+    ReflectometryReductionOneAuto2 alg;
+    alg.initialize();
+    alg.setPropertyValue("InputWorkspace", "input");
+    alg.setPropertyValue("FirstTransmissionRun", "trans");
+    alg.setProperty("WavelengthMin", 1.5);
+    alg.setProperty("WavelengthMax", 15.0);
+    alg.setProperty("ProcessingInstructions", "2");
+    alg.setProperty("MomentumTransferStep", 0.04);
+    alg.setProperty("PolarizationAnalysis", "PA");
+    alg.setProperty("Pp", "1,1,2");
+    alg.setProperty("Ap", "1,1,2");
+    alg.setProperty("Rho", "1,1");
+    alg.setProperty("Alpha", "1");
+    alg.setPropertyValue("OutputWorkspace", "IvsQ");
+    alg.setPropertyValue("OutputWorkspaceBinned", "IvsQ_binned");
+    alg.setPropertyValue("OutputWorkspaceWavelength", "IvsLam");
+    alg.execute();
+    auto outQGroup =
+        AnalysisDataService::Instance().retrieveWS<WorkspaceGroup>("IvsQ");
+    auto outLamGroup =
+        AnalysisDataService::Instance().retrieveWS<WorkspaceGroup>("IvsLam");
+
+    TS_ASSERT(outQGroup);
+    TS_ASSERT(outLamGroup);
+
+    if (!outQGroup || !outLamGroup)
+      return;
+
+    TS_ASSERT_EQUALS(outQGroup->size(), 4);
+    TS_ASSERT_EQUALS(outLamGroup->size(), 4);
+
+    {
+      auto outQ =
+          boost::dynamic_pointer_cast<MatrixWorkspace>(outQGroup->getItem(0));
+      TS_ASSERT_EQUALS(outQ->getNumberHistograms(), 1);
+      TS_ASSERT_EQUALS(outQ->blocksize(), 14);
+      // X range in outQ
+      TS_ASSERT_DELTA(outQ->x(0)[0], 0.3353, 0.0001);
+      TS_ASSERT_DELTA(outQ->x(0)[7], 0.5962, 0.0001);
+      auto outLam =
+          boost::dynamic_pointer_cast<MatrixWorkspace>(outLamGroup->getItem(0));
+      // X range in outLam
+      TS_ASSERT_DELTA(outLam->x(0)[0], 1.7924, 0.0001);
+      TS_ASSERT_DELTA(outLam->x(0)[7], 8.0658, 0.0001);
+    }
+
+    {
+      auto outQ =
+          boost::dynamic_pointer_cast<MatrixWorkspace>(outQGroup->getItem(1));
+      TS_ASSERT_EQUALS(outQ->getNumberHistograms(), 1);
+      TS_ASSERT_EQUALS(outQ->blocksize(), 14);
+      // X range in outQ
+      TS_ASSERT_DELTA(outQ->x(0)[0], 0.3353, 0.0001);
+      TS_ASSERT_DELTA(outQ->x(0)[7], 0.5962, 0.0001);
+      auto outLam =
+          boost::dynamic_pointer_cast<MatrixWorkspace>(outLamGroup->getItem(1));
+      // X range in outLam
+      TS_ASSERT_DELTA(outLam->x(0)[0], 1.7924, 0.0001);
+      TS_ASSERT_DELTA(outLam->x(0)[7], 8.0658, 0.0001);
+    }
   }
 };
 

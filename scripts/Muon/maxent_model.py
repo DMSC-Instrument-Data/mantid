@@ -1,40 +1,116 @@
 from __future__ import (absolute_import, division, print_function)
+
 from six import iteritems
+
 import mantid.simpleapi as mantid
 
 
-class MaxEntModel(object):
-    # A simple class to hold the MaxEnt algorithm
+class MaxEntWrapper(object):
 
-    def __init__(self):
-        self.alg=mantid.AlgorithmManager.create("MaxEnt")
-        self.alg.initialize()
-        self.alg.setChild(True)
+    """
+    A class to wrap the different parts
+    of the MaxEnt and its preprocessing.
+    This keeps the main MaxEnt class simple.
+    """
 
-    def setInputs(self,inputs,runName):
-        self.inputs=inputs
-        for name,value in iteritems(self.inputs):
-            self.alg.setProperty(name,value)
-        self.run=runName
+    def __init__(self, maxent):
+        self.name = "MaxEnt"
+        self.model = maxent
+
+    def loadData(self, inputs):
+        """
+        store the data in the wrapper for later
+        """
+        self.phaseTable = inputs.get("phaseTable",None)
+        self.maxent = inputs.get("maxent",None)
+        self.model.setRun(inputs["Run"])
 
     def execute(self):
-        self.alg.execute()
+        """
+        runs the relevant parts of the MaxEnt and the preprocessing
+        """
+        if self.phaseTable is not None:
+            self.model.makePhaseTable(self.phaseTable)
+
+        if self.maxent is not None:
+            self.model.MaxEntAlg(self.maxent)
 
     def cancel(self):
-        self.alg.cancel()
+        self.model.cancel()
 
     def output(self):
-        mantid.AnalysisDataService.addOrReplace( self.inputs["EvolChi"],self.alg.getProperty("EvolChi").value)
-        mantid.AnalysisDataService.addOrReplace( self.inputs["EvolAngle"],self.alg.getProperty("EvolAngle").value)
-        mantid.AnalysisDataService.addOrReplace( self.inputs["ReconstructedImage"],self.alg.getProperty("ReconstructedImage").value)
-        mantid.AnalysisDataService.addOrReplace( self.inputs["ReconstructedData"],self.alg.getProperty("ReconstructedData").value)
+        return
 
+
+class MaxEntModel(object):
+
+    """
+    A simple class which executes
+    the relevant algorithms for
+    the analysis.
+    """
+
+    def __init__(self):
+        self.name = "MaxEnt"
+        self.alg = None
+
+    def setRun(self, run):
+        self.run = run
+
+    def MaxEntAlg(self, inputs):
+        """
+        Use the MaxEnt alg
+        """
+        self.alg = mantid.AlgorithmManager.create("MuonMaxent")
+        self.alg.initialize()
+        self.alg.setAlwaysStoreInADS(False)
+        for name, value in iteritems(inputs):
+            self.alg.setProperty(name, value)
+        self.alg.execute()
+        self.addOutput(inputs, self.alg, "OutputWorkspace")
+        self.addOutput(inputs, self.alg, "OutputPhaseTable")
+        self.addOutput(inputs, self.alg, "OutputDeadTimeTable")
+        self.addOutput(inputs, self.alg, "ReconstructedSpectra")
+        self.addOutput(inputs, self.alg, "PhaseConvergenceTable")
+        self.alg = None
+
+    def makePhaseTable(self, inputs):
+        """
+        generates a phase table from CalMuonDetectorPhases
+        """
+        self.alg = mantid.AlgorithmManager.create("CalMuonDetectorPhases")
+        self.alg.initialize()
+        self.alg.setAlwaysStoreInADS(False)
+
+        for name, value in iteritems(inputs):
+            self.alg.setProperty(name, value)
+        if inputs["InputWorkspace"] != "MuonAnalysis":
+            raise ValueError(
+                "Cannot currently generate phase table from this data using CalMuonDetectorPhases")
+        self.alg.execute()
+        name = "DetectorTable"
+        mantid.AnalysisDataService.addOrReplace(
+            inputs[name],
+            self.alg.getProperty(name).value)
+        self.alg = None
+
+    def addOutput(self, inputs, alg, name):
+        if name in inputs:
+            mantid.AnalysisDataService.addOrReplace(
+                inputs[name],
+                alg.getProperty(name).value)
+        else:
+            return
         if mantid.AnalysisDataService.doesExist(self.run):
-            group=mantid.AnalysisDataService.retrieve(self.run)
+            group = mantid.AnalysisDataService.retrieve(self.run)
         else:
             mantid.GroupWorkspaces(OutputWorkspace=self.run)
 
-        group.add(self.inputs["EvolChi"])
-        group.add(self.inputs["EvolAngle"])
-        group.add(self.inputs["ReconstructedImage"])
-        group.add(self.inputs["ReconstructedData"])
+        group.add(inputs[name])
+
+    def cancel(self):
+        if self.alg is not None:
+            self.alg.cancel()
+
+    def getName(self):
+        return self.name

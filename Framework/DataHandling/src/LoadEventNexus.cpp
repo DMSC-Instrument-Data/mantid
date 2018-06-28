@@ -22,12 +22,11 @@
 #include "MantidIndexing/IndexInfo.h"
 
 #include <boost/function.hpp>
-#include <boost/random/mersenne_twister.hpp>
-#include <boost/random/uniform_real.hpp>
 #include <boost/shared_array.hpp>
 #include <boost/shared_ptr.hpp>
 
 #include <functional>
+#include <random>
 
 using Mantid::Types::Core::DateAndTime;
 using Mantid::Types::Event::TofEvent;
@@ -318,7 +317,7 @@ void LoadEventNexus::setTopEntryName() {
     m_top_entry_name = nxentryProperty;
     return;
   }
-  typedef std::map<std::string, std::string> string_map_t;
+  using string_map_t = std::map<std::string, std::string>;
   try {
     string_map_t::const_iterator it;
     // assume we're at the top, otherwise: m_file->openPath("/");
@@ -861,12 +860,15 @@ void LoadEventNexus::loadEvents(API::Progress *const prog,
     auto ws = m_ws->getSingleHeldWorkspace();
     m_file->close();
     try {
-      ParallelEventLoader::load(*ws, m_filename, m_top_entry_name, bankNames);
+      ParallelEventLoader::load(*ws, m_filename, m_top_entry_name, bankNames,
+                                event_id_is_spec);
       g_log.information() << "Used ParallelEventLoader.\n";
       loaded = true;
       shortest_tof = 0.0;
       longest_tof = 1e10;
     } catch (const std::runtime_error &) {
+      g_log.warning()
+          << "ParallelEventLoader failed, falling back to default loader.\n";
     }
     safeOpenFile(m_filename);
   }
@@ -1140,7 +1142,7 @@ bool LoadEventNexus::hasEventMonitors() {
   try {
     m_file->openPath("/" + m_top_entry_name);
     // Start with the base entry
-    typedef std::map<std::string, std::string> string_map_t;
+    using string_map_t = std::map<std::string, std::string>;
     // Now we want to go through and find the monitors
     string_map_t entries = m_file->getEntries();
     for (string_map_t::const_iterator it = entries.begin(); it != entries.end();
@@ -1150,9 +1152,10 @@ bool LoadEventNexus::hasEventMonitors() {
         break;
       }
     }
-    m_file->openData("event_id");
+    bool hasTotalCounts = false;
+    bool oldNeXusFileNames = false;
+    result = numEvents(*m_file, hasTotalCounts, oldNeXusFileNames) > 0;
     m_file->closeGroup();
-    result = true;
   } catch (::NeXus::Exception &) {
     result = false;
   }
@@ -1399,6 +1402,25 @@ void LoadEventNexus::setTimeFilters(const bool monitors) {
 //-----------------------------------------------------------------------------
 //               ISIS event corrections
 //-----------------------------------------------------------------------------
+// LoadEventNexus::loadTimeOfFlight and LoadEventNexus::loadTimeOfFlightData
+// concern loading time of flight bins from early ISIS event mode datasets.
+//
+// Due to hardware issues with retro-fitting event mode to old electronics,
+// ISIS event mode is really a very fine histogram with between 1 and 2
+// microseconds bins.
+//
+// If we just took "middle of bin" as the true event time here then WISH
+// observed strange ripples when they added spectra. The solution was to
+// randomise the probability of an event within the bin.
+//
+// This randomisation is now performed in the control program which also writes
+// the "event_time_offset_shift" dataset (with a single value of "random") when
+// it has been performed. If this dataset is present in an event file then no
+// randomisation is performed in LoadEventNexus.
+//
+// This code should remain for loading older ISIS event datasets.
+//-----------------------------------------------------------------------------
+
 /**
 * Check if time_of_flight can be found in the file and load it
 *
@@ -1414,7 +1436,7 @@ void LoadEventNexus::loadTimeOfFlight(EventWorkspaceCollection_sptr WS,
   m_file->openPath("/");
   m_file->openGroup(entry_name, "NXentry");
 
-  typedef std::map<std::string, std::string> string_map_t;
+  using string_map_t = std::map<std::string, std::string>;
   string_map_t entries = m_file->getEntries();
 
   if (entries.find("detector_1_events") == entries.end()) { // not an ISIS file
@@ -1547,7 +1569,7 @@ void LoadEventNexus::loadTimeOfFlightData(::NeXus::File &file,
   }
 
   // random number generator
-  boost::mt19937 rand_gen;
+  std::mt19937 rng;
 
   // loop over spectra
   for (size_t wi = start_wi; wi < end_wi; ++wi) {
@@ -1577,10 +1599,10 @@ void LoadEventNexus::loadTimeOfFlightData(::NeXus::File &file,
       if (m > 0) { // m events in this bin
         double left = double(tof[i - 1]);
         // spread the events uniformly inside the bin
-        boost::uniform_real<> distribution(left, right);
+        std::uniform_real_distribution<double> flat(left, right);
         std::vector<double> random_numbers(m);
         for (double &random_number : random_numbers) {
-          random_number = distribution(rand_gen);
+          random_number = flat(rng);
         }
         std::sort(random_numbers.begin(), random_numbers.end());
         auto it = random_numbers.begin();
@@ -1681,8 +1703,6 @@ bool LoadEventNexus::canUseParallelLoader(const bool haveWeights,
   if (m_ws->nPeriods() != 1)
     return false;
   if (haveWeights)
-    return false;
-  if (event_id_is_spec)
     return false;
   if (oldNeXusFileNames)
     return false;

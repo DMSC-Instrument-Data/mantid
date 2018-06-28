@@ -3,7 +3,9 @@
 #include "MantidAPI/AlgorithmManager.h"
 #include "MantidAPI/AnalysisDataService.h"
 #include "MantidAPI/MatrixWorkspace.h"
-#include "MantidAPI/Run.h"
+#include "MantidQtWidgets/Common/MantidAlgorithmMetatype.h"
+
+#include <boost/algorithm/string/join.hpp>
 
 using namespace Mantid;
 
@@ -18,210 +20,319 @@ std::string stripWSNameFromFilename(const std::string &fullyQualifiedFilename) {
   return filenameSegments[0];
 }
 
-size_t getBankID(API::MatrixWorkspace_const_sptr ws) {
-  const static std::string bankIDPropertyName = "bankid";
-  if (ws->run().hasProperty(bankIDPropertyName)) {
-    const auto log = dynamic_cast<Kernel::PropertyWithValue<int> *>(
-        ws->run().getLogData(bankIDPropertyName));
-    return boost::lexical_cast<size_t>(log->value());
+std::string refinementMethodToString(
+    const MantidQt::CustomInterfaces::GSASRefinementMethod &method) {
+  switch (method) {
+  case MantidQt::CustomInterfaces::GSASRefinementMethod::PAWLEY:
+    return "Pawley refinement";
+  case MantidQt::CustomInterfaces::GSASRefinementMethod::RIETVELD:
+    return "Rietveld refinement";
+  default:
+    throw std::invalid_argument(
+        "Invalid refinement method: please contact the development team");
   }
-  throw std::runtime_error("Bank ID was not set in the sample logs.");
 }
 
 } // anonymous namespace
 
 namespace MantidQt {
 namespace CustomInterfaces {
+
+EnggDiffGSASFittingModel::EnggDiffGSASFittingModel() {
+  qRegisterMetaType<
+      MantidQt::CustomInterfaces::GSASIIRefineFitPeaksOutputProperties>(
+      "GSASIIRefineFitPeaksOutputProperties");
+  qRegisterMetaType<Mantid::API::IAlgorithm_sptr>("IAlgorithm_sptr");
+  qRegisterMetaType<std::vector<GSASIIRefineFitPeaksOutputProperties>>(
+      "std::vector<GSASIIRefineFitPeaksOutputProperties>");
+}
+
+EnggDiffGSASFittingModel::~EnggDiffGSASFittingModel() {
+  if (m_workerThread) {
+    if (m_workerThread->isRunning()) {
+      m_workerThread->wait(10);
+    }
+  }
+}
+
 void EnggDiffGSASFittingModel::addFitResultsToMaps(
-    const int runNumber, const size_t bank, const double rwp,
-    const std::string &fittedPeaksWSName,
-    const std::string &latticeParamsTableName) {
-  addRwp(runNumber, bank, rwp);
-
-  API::AnalysisDataServiceImpl &ADS = API::AnalysisDataService::Instance();
-  const auto fittedPeaks =
-      ADS.retrieveWS<API::MatrixWorkspace>(fittedPeaksWSName);
-  addFittedPeaks(runNumber, bank, fittedPeaks);
-
-  const auto latticeParams =
-      ADS.retrieveWS<API::ITableWorkspace>(latticeParamsTableName);
-  addLatticeParams(runNumber, bank, latticeParams);
-}
-
-void EnggDiffGSASFittingModel::addFittedPeaks(const int runNumber,
-                                              const size_t bank,
-                                              API::MatrixWorkspace_sptr ws) {
-  m_fittedPeaksMap.add(runNumber, bank, ws);
-}
-
-void EnggDiffGSASFittingModel::addFocusedRun(const int runNumber,
-                                             const size_t bank,
-                                             API::MatrixWorkspace_sptr ws) {
-  m_focusedWorkspaceMap.add(runNumber, bank, ws);
+    const RunLabel &runLabel, const double rwp, const double sigma,
+    const double gamma, const API::ITableWorkspace_sptr latticeParams) {
+  addRwp(runLabel, rwp);
+  addSigma(runLabel, sigma);
+  addGamma(runLabel, gamma);
+  addLatticeParams(runLabel, latticeParams);
 }
 
 void EnggDiffGSASFittingModel::addLatticeParams(
-    const int runNumber, const size_t bank, API::ITableWorkspace_sptr table) {
-  m_latticeParamsMap.add(runNumber, bank, table);
+    const RunLabel &runLabel, API::ITableWorkspace_sptr table) {
+  m_latticeParamsMap.add(runLabel, table);
 }
 
-void EnggDiffGSASFittingModel::addRwp(const int runNumber, const size_t bank,
+void EnggDiffGSASFittingModel::addGamma(const RunLabel &runLabel,
+                                        const double gamma) {
+  m_gammaMap.add(runLabel, gamma);
+}
+
+void EnggDiffGSASFittingModel::addRwp(const RunLabel &runLabel,
                                       const double rwp) {
-  m_rwpMap.add(runNumber, bank, rwp);
+  m_rwpMap.add(runLabel, rwp);
+}
+
+void EnggDiffGSASFittingModel::addSigma(const RunLabel &runLabel,
+                                        const double sigma) {
+  m_sigmaMap.add(runLabel, sigma);
 }
 
 namespace {
 
-std::string generateFittedPeaksWSName(const int runNumber, const size_t bank) {
-  return std::to_string(runNumber) + "_" + std::to_string(bank) +
-         "_gsasii_fitted_peaks";
+std::string generateFittedPeaksWSName(const RunLabel &runLabel) {
+  return std::to_string(runLabel.runNumber) + "_" +
+         std::to_string(runLabel.bank) + "_gsasii_fitted_peaks";
 }
 
-std::string generateLatticeParamsName(const int runNumber, const size_t bank) {
-  return std::to_string(runNumber) + "_" + std::to_string(bank) +
-         "_lattice_params";
+std::string generateLatticeParamsName(const RunLabel &runLabel) {
+  return std::to_string(runLabel.runNumber) + "_" +
+         std::to_string(runLabel.bank) + "_lattice_params";
 }
 }
 
-bool EnggDiffGSASFittingModel::doPawleyRefinement(
-    const int runNumber, const size_t bank, const std::string &instParamFile,
-    const std::vector<std::string> &phaseFiles, const std::string &pathToGSASII,
-    const std::string &GSASIIProjectFile, const double dMin,
-    const double negativeWeight) {
-  const auto inputWS = getFocusedWorkspace(runNumber, bank);
-  if (!inputWS) {
-    return false;
+std::pair<API::IAlgorithm_sptr, GSASIIRefineFitPeaksOutputProperties>
+EnggDiffGSASFittingModel::doGSASRefinementAlgorithm(
+    const GSASIIRefineFitPeaksParameters &params) {
+  auto gsasAlg =
+      API::AlgorithmManager::Instance().create("GSASIIRefineFitPeaks");
+
+  gsasAlg->setProperty("RefinementMethod",
+                       refinementMethodToString(params.refinementMethod));
+  gsasAlg->setProperty("InputWorkspace", params.inputWorkspace);
+  gsasAlg->setProperty("InstrumentFile", params.instParamsFile);
+  gsasAlg->setProperty("PhaseInfoFiles",
+                       boost::algorithm::join(params.phaseFiles, ","));
+  gsasAlg->setProperty("PathToGSASII", params.gsasHome);
+
+  if (params.dMin) {
+    gsasAlg->setProperty("PawleyDMin", *(params.dMin));
   }
-  const auto outputWSName = generateFittedPeaksWSName(runNumber, bank);
-  const auto latticeParamsName = generateLatticeParamsName(runNumber, bank);
-
-  const auto rwp = doGSASRefinementAlgorithm(
-      *inputWS, outputWSName, latticeParamsName, "Pawley refinement",
-      instParamFile, phaseFiles, pathToGSASII, GSASIIProjectFile, dMin,
-      negativeWeight);
-
-  if (!rwp) {
-    return false;
+  if (params.negativeWeight) {
+    gsasAlg->setProperty("PawleyNegativeWeight", *(params.negativeWeight));
   }
+  if (params.xMin) {
+    gsasAlg->setProperty("XMin", *(params.xMin));
+  }
+  if (params.xMax) {
+    gsasAlg->setProperty("XMax", *(params.xMax));
+  }
+  gsasAlg->setProperty("RefineSigma", params.refineSigma);
+  gsasAlg->setProperty("RefineGamma", params.refineGamma);
 
-  addFitResultsToMaps(runNumber, bank, *rwp, outputWSName, latticeParamsName);
+  const auto outputWSName = generateFittedPeaksWSName(params.runLabel);
+  const auto latticeParamsName = generateLatticeParamsName(params.runLabel);
+  gsasAlg->setProperty("OutputWorkspace", outputWSName);
+  gsasAlg->setProperty("LatticeParameters", latticeParamsName);
+  gsasAlg->setProperty("SaveGSASIIProjectFile", params.gsasProjectFile);
+  gsasAlg->execute();
 
-  return true;
+  const double rwp = gsasAlg->getProperty("Rwp");
+  const double sigma = gsasAlg->getProperty("Sigma");
+  const double gamma = gsasAlg->getProperty("Gamma");
+
+  API::AnalysisDataServiceImpl &ADS = API::AnalysisDataService::Instance();
+  const auto fittedPeaks = ADS.retrieveWS<API::MatrixWorkspace>(outputWSName);
+  const auto latticeParams =
+      ADS.retrieveWS<API::ITableWorkspace>(latticeParamsName);
+  return std::make_pair(gsasAlg, GSASIIRefineFitPeaksOutputProperties(
+                                     rwp, sigma, gamma, fittedPeaks,
+                                     latticeParams, params.runLabel));
 }
 
-boost::optional<double> EnggDiffGSASFittingModel::doGSASRefinementAlgorithm(
-    API::MatrixWorkspace_sptr inputWorkspace,
-    const std::string &outputWorkspaceName,
-    const std::string &latticeParamsName, const std::string &refinementMethod,
-    const std::string &instParamFile,
-    const std::vector<std::string> &phaseFiles, const std::string &pathToGSASII,
-    const std::string &GSASIIProjectFile, const double dMin,
-    const double negativeWeight) {
-  double rwp = -1;
-  try {
-    auto gsasAlg =
-        API::AlgorithmManager::Instance().create("GSASIIRefineFitPeaks");
-    gsasAlg->setProperty("RefinementMethod", refinementMethod);
-    gsasAlg->setProperty("InputWorkspace", inputWorkspace);
-    gsasAlg->setProperty("OutputWorkspace", outputWorkspaceName);
-    gsasAlg->setProperty("LatticeParameters", latticeParamsName);
-    gsasAlg->setProperty("InstrumentFile", instParamFile);
-    gsasAlg->setProperty("PhaseInfoFiles", phaseFiles);
-    gsasAlg->setProperty("PathToGSASII", pathToGSASII);
-    gsasAlg->setProperty("SaveGSASIIProjectFile", GSASIIProjectFile);
-    gsasAlg->setProperty("PawleyDMin", dMin);
-    gsasAlg->setProperty("PawleyNegativeWeight", negativeWeight);
-    gsasAlg->execute();
+void EnggDiffGSASFittingModel::doRefinements(
+    const std::vector<GSASIIRefineFitPeaksParameters> &params) {
+  m_workerThread = Mantid::Kernel::make_unique<QThread>(this);
+  EnggDiffGSASFittingWorker *worker =
+      new EnggDiffGSASFittingWorker(this, params);
+  worker->moveToThread(m_workerThread.get());
 
-    rwp = gsasAlg->getProperty("Rwp");
-  } catch (const std::exception) {
-    return boost::none;
-  }
-  return rwp;
-}
-
-bool EnggDiffGSASFittingModel::doRietveldRefinement(
-    const int runNumber, const size_t bank, const std::string &instParamFile,
-    const std::vector<std::string> &phaseFiles, const std::string &pathToGSASII,
-    const std::string &GSASIIProjectFile) {
-  const auto inputWS = getFocusedWorkspace(runNumber, bank);
-  if (!inputWS) {
-    return false;
-  }
-  const auto outputWSName = generateFittedPeaksWSName(runNumber, bank);
-  const auto latticeParamsName = generateLatticeParamsName(runNumber, bank);
-
-  const auto rwp = doGSASRefinementAlgorithm(
-      *inputWS, outputWSName, latticeParamsName, "Rietveld refinement",
-      instParamFile, phaseFiles, pathToGSASII, GSASIIProjectFile,
-      DEFAULT_PAWLEY_DMIN, DEFAULT_PAWLEY_NEGATIVE_WEIGHT);
-
-  if (!rwp) {
-    return false;
-  }
-
-  addFitResultsToMaps(runNumber, bank, *rwp, outputWSName, latticeParamsName);
-
-  return true;
-}
-
-boost::optional<API::MatrixWorkspace_sptr>
-EnggDiffGSASFittingModel::getFittedPeaks(const int runNumber,
-                                         const size_t bank) const {
-  return getFromRunMapOptional(m_fittedPeaksMap, runNumber, bank);
-}
-
-boost::optional<API::MatrixWorkspace_sptr>
-EnggDiffGSASFittingModel::getFocusedWorkspace(const int runNumber,
-                                              const size_t bank) const {
-  return getFromRunMapOptional(m_focusedWorkspaceMap, runNumber, bank);
+  connect(m_workerThread.get(), SIGNAL(started()), worker,
+          SLOT(doRefinements()));
+  connect(worker,
+          SIGNAL(refinementSuccessful(Mantid::API::IAlgorithm_sptr,
+                                      GSASIIRefineFitPeaksOutputProperties)),
+          this, SLOT(processRefinementSuccessful(
+                    Mantid::API::IAlgorithm_sptr,
+                    const GSASIIRefineFitPeaksOutputProperties &)));
+  connect(worker, SIGNAL(refinementsComplete(
+                      Mantid::API::IAlgorithm_sptr,
+                      std::vector<GSASIIRefineFitPeaksOutputProperties>)),
+          this,
+          SLOT(processRefinementsComplete(
+              Mantid::API::IAlgorithm_sptr,
+              const std::vector<GSASIIRefineFitPeaksOutputProperties> &)));
+  connect(worker, SIGNAL(refinementFailed(const std::string &)), this,
+          SLOT(processRefinementFailed(const std::string &)));
+  connect(worker, SIGNAL(refinementCancelled()), this,
+          SLOT(processRefinementCancelled()));
+  connect(m_workerThread.get(), SIGNAL(finished()), m_workerThread.get(),
+          SLOT(deleteLater()));
+  connect(worker,
+          SIGNAL(refinementSuccessful(Mantid::API::IAlgorithm_sptr,
+                                      GSASIIRefineFitPeaksOutputProperties)),
+          worker, SLOT(deleteLater()));
+  connect(worker, SIGNAL(refinementFailed(const std::string &)), worker,
+          SLOT(deleteLater()));
+  m_workerThread->start();
 }
 
 boost::optional<API::ITableWorkspace_sptr>
-EnggDiffGSASFittingModel::getLatticeParams(const int runNumber,
-                                           const size_t bank) const {
-  return getFromRunMapOptional(m_latticeParamsMap, runNumber, bank);
-}
-
-std::vector<std::pair<int, size_t>>
-EnggDiffGSASFittingModel::getRunLabels() const {
-  return m_focusedWorkspaceMap.getRunNumbersAndBankIDs();
+EnggDiffGSASFittingModel::getLatticeParams(const RunLabel &runLabel) const {
+  return getFromRunMapOptional(m_latticeParamsMap, runLabel);
 }
 
 boost::optional<double>
-EnggDiffGSASFittingModel::getRwp(const int runNumber, const size_t bank) const {
-  return getFromRunMapOptional(m_rwpMap, runNumber, bank);
+EnggDiffGSASFittingModel::getGamma(const RunLabel &runLabel) const {
+  return getFromRunMapOptional(m_gammaMap, runLabel);
 }
 
-bool EnggDiffGSASFittingModel::hasFittedPeaksForRun(const int runNumber,
-                                                    const size_t bank) const {
-  return m_fittedPeaksMap.contains(runNumber, bank);
+boost::optional<double>
+EnggDiffGSASFittingModel::getRwp(const RunLabel &runLabel) const {
+  return getFromRunMapOptional(m_rwpMap, runLabel);
 }
 
-bool EnggDiffGSASFittingModel::hasFocusedRun(const int runNumber,
-                                             const size_t bank) const {
-  return m_focusedWorkspaceMap.contains(runNumber, bank);
+boost::optional<double>
+EnggDiffGSASFittingModel::getSigma(const RunLabel &runLabel) const {
+  return getFromRunMapOptional(m_sigmaMap, runLabel);
 }
 
-bool EnggDiffGSASFittingModel::loadFocusedRun(const std::string &filename) {
+bool EnggDiffGSASFittingModel::hasFitResultsForRun(
+    const RunLabel &runLabel) const {
+  return m_rwpMap.contains(runLabel) && m_sigmaMap.contains(runLabel) &&
+         m_gammaMap.contains(runLabel);
+}
+
+Mantid::API::MatrixWorkspace_sptr
+EnggDiffGSASFittingModel::loadFocusedRun(const std::string &filename) const {
   const auto wsName = stripWSNameFromFilename(filename);
 
-  try {
-    auto loadAlg = API::AlgorithmManager::Instance().create("Load");
-    loadAlg->setProperty("Filename", filename);
-    loadAlg->setProperty("OutputWorkspace", wsName);
-    loadAlg->execute();
-  } catch (const std::exception) {
-    return false;
-  }
+  auto loadAlg = API::AlgorithmManager::Instance().create("Load");
+  loadAlg->setProperty("Filename", filename);
+  loadAlg->setProperty("OutputWorkspace", wsName);
+  loadAlg->execute();
 
   API::AnalysisDataServiceImpl &ADS = API::AnalysisDataService::Instance();
   const auto ws = ADS.retrieveWS<API::MatrixWorkspace>(wsName);
+  return ws;
+}
 
-  const auto runNumber = ws->getRunNumber();
-  const auto bank = getBankID(ws);
-  m_focusedWorkspaceMap.add(runNumber, bank, ws);
-  return true;
+void EnggDiffGSASFittingModel::processRefinementsComplete(
+    Mantid::API::IAlgorithm_sptr alg,
+    const std::vector<GSASIIRefineFitPeaksOutputProperties> &
+        refinementResultSets) {
+  m_observer->notifyRefinementsComplete(alg, refinementResultSets);
+}
+
+void EnggDiffGSASFittingModel::processRefinementFailed(
+    const std::string &failureMessage) {
+  if (m_observer) {
+    m_observer->notifyRefinementFailed(failureMessage);
+  }
+}
+
+void EnggDiffGSASFittingModel::processRefinementSuccessful(
+    API::IAlgorithm_sptr successfulAlgorithm,
+    const GSASIIRefineFitPeaksOutputProperties &refinementResults) {
+  addFitResultsToMaps(refinementResults.runLabel, refinementResults.rwp,
+                      refinementResults.sigma, refinementResults.gamma,
+                      refinementResults.latticeParamsWS);
+  if (m_observer) {
+    m_observer->notifyRefinementSuccessful(successfulAlgorithm,
+                                           refinementResults);
+  }
+}
+
+void EnggDiffGSASFittingModel::processRefinementCancelled() {
+  if (m_observer) {
+    m_observer->notifyRefinementCancelled();
+  }
+}
+
+void EnggDiffGSASFittingModel::saveRefinementResultsToHDF5(
+    const Mantid::API::IAlgorithm_sptr successfulAlg,
+    const std::vector<GSASIIRefineFitPeaksOutputProperties> &
+        refinementResultSets,
+    const std::string &filename) const {
+  auto saveAlg = API::AlgorithmManager::Instance().create(
+      "EnggSaveGSASIIFitResultsToHDF5");
+
+  const auto numRuns = refinementResultSets.size();
+  std::vector<std::string> latticeParamWSNames;
+  latticeParamWSNames.reserve(numRuns);
+  std::vector<long> runNumbers;
+  runNumbers.reserve(numRuns);
+  std::vector<long> bankIDs;
+  bankIDs.reserve(numRuns);
+  std::vector<double> sigmas;
+  sigmas.reserve(numRuns);
+  std::vector<double> gammas;
+  gammas.reserve(numRuns);
+  std::vector<double> rwps;
+  rwps.reserve(numRuns);
+
+  const bool refineSigma = successfulAlg->getProperty("RefineSigma");
+  saveAlg->setProperty("RefineSigma", refineSigma);
+  const bool refineGamma = successfulAlg->getProperty("RefineGamma");
+  saveAlg->setProperty("RefineGamma", refineGamma);
+
+  for (const auto &refinementResults : refinementResultSets) {
+    const auto &runLabel = refinementResults.runLabel;
+    const auto latticeParams = *getLatticeParams(runLabel);
+
+    latticeParamWSNames.emplace_back(latticeParams->getName());
+    runNumbers.emplace_back(runLabel.runNumber);
+    bankIDs.emplace_back(static_cast<long>(runLabel.bank));
+    rwps.emplace_back(refinementResults.rwp);
+
+    if (refineSigma) {
+      sigmas.emplace_back(refinementResults.sigma);
+    }
+    if (refineGamma) {
+      gammas.emplace_back(refinementResults.gamma);
+    }
+  }
+
+  saveAlg->setProperty("LatticeParamWorkspaces", latticeParamWSNames);
+  saveAlg->setProperty("BankIDs", bankIDs);
+  saveAlg->setProperty("RunNumbers", runNumbers);
+
+  const std::string refinementMethod =
+      successfulAlg->getProperty("RefinementMethod");
+  saveAlg->setProperty("RefinementMethod", refinementMethod);
+  saveAlg->setProperty("XMin", successfulAlg->getPropertyValue("XMin"));
+  saveAlg->setProperty("XMax", successfulAlg->getPropertyValue("XMax"));
+
+  if (refinementMethod == "Pawley refinement") {
+    saveAlg->setProperty("PawleyDMin",
+                         successfulAlg->getPropertyValue("PawleyDMin"));
+    saveAlg->setProperty(
+        "PawleyNegativeWeight",
+        successfulAlg->getPropertyValue("PawleyNegativeWeight"));
+  }
+
+  if (refineSigma) {
+    saveAlg->setProperty("Sigma", sigmas);
+  }
+
+  if (refineGamma) {
+    saveAlg->setProperty("Gamma", gammas);
+  }
+
+  saveAlg->setProperty("Rwp", rwps);
+  saveAlg->setProperty("Filename", filename);
+  saveAlg->execute();
+}
+
+void EnggDiffGSASFittingModel::setObserver(
+    boost::shared_ptr<IEnggDiffGSASFittingObserver> observer) {
+  m_observer = observer;
 }
 
 } // CustomInterfaces
